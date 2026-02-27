@@ -1,0 +1,925 @@
+---
+title: "R Practice-Notebook-BWH"
+output: html_notebook
+---
+
+*# Load and inspect*
+
+```{r}
+library(tidyverse)
+
+# read gz file directly
+expr_raw <- read.delim("GSE76925_non-normalized (2).txt.gz", 
+                       header = TRUE, 
+                       sep = "\t",
+                       check.names = FALSE)
+
+dim(expr_raw)
+head(expr_raw[, 1:6])
+
+```
+Here, sample1 (intensity), sample1.Detection.Pval (quality flag for that intensity).
+
+*# Split expression columns vs detection p-values*
+What we did: 
+  We separated the dataset into:
+  ->an expression matrix (expr_mat)
+  ->a detection p-value matrix (detp_mat)
+Why we did it:
+  Because detection p-values are not expression. They’re quality flags. Mixing them with expression breaks downstream analysis (PCA, DE, clustering).
+  
+```{r}
+# Expression columns are those NOT ending in ".Detection.Pval"
+expr_mat <- expr_raw[, !grepl("Detection\\.Pval$", colnames(expr_raw)), drop = FALSE]
+
+# Detection p-value columns DO end in ".Detection.Pval"
+detp_mat <- expr_raw[, grepl("Detection\\.Pval$", colnames(expr_raw)), drop = FALSE]
+
+# Sanity checks
+dim(expr_mat); dim(detp_mat)
+head(colnames(expr_mat), 6)
+head(colnames(detp_mat), 6)
+```
+
+*# Filter out probes that are mostly “not detected”*
+What we did
+  We kept only probes that are confidently detected in a decent fraction of samples.
+
+Why we did it
+  Microarrays include many probes that are basically noise in your tissue type. If you keep them:
+
+ ->PCA becomes noisy
+ ->differential expression has more false positives
+ ->multiple testing burden explodes
+ 
+```{r}
+# TRUE where probe is detected
+detected <- detp_mat < 0.01
+
+# Keep probes detected in at least 20% of samples
+keep <- rowMeans(detected, na.rm = TRUE) >= 0.20
+
+# Filter expression matrix
+expr_f <- expr_mat[keep, , drop = FALSE]
+
+dim(expr_f)
+```
+ 
+*# Log2 transform the intensities*
+What we did
+  We applied log2(x + 1) to the filtered expression matrix.
+
+Why we did it
+  Microarray intensity values are typically:
+
+  ->right-skewed (a few probes have huge intensities)
+  ->heteroscedastic (variance increases with mean)
+
+  Log-transforming:
+
+  ->stabilises variance
+  ->makes distributions more “normal-ish”
+  ->improves PCA and linear modelling assumptions 
+```{r}
+expr_log <- log2(expr_f + 1)
+
+summary(as.vector(expr_log))
+```
+
+*#Attach real COPD vs Control labels*
+What we need now
+  Right now, you have expression values but no group labels (COPD vs control).To run proper COPD analysis (limma), we must fetch phenotype metadata from GEO and map it to your samples.
+
+Why we need it
+  Differential expression requires a design matrix like:
+
+  ->COPD = 1
+  ->Control = 0
+Optionally adjusted for age/sex/etc.
+
+  => Without metadata, we can do unsupervised PCA, but not “COPD vs Control DE”.
+
+What we’ll do next (conceptually)
+
+  ->Download GEO metadata for GSE76925
+  ->Identify which samples are COPD vs control
+  ->Align those labels with your column names
+  ->Then run PCA + limma
+  
+###Quick revision summary (one-liners)
+ =>Split expression vs Detection.Pval → because Detection.Pval is QC, not expression
+ =>Filter low-detected probes → because many probes are noise and ruin analysis
+ =>Log2 transform → because intensities are skewed and variance isn’t stable
+ =>Fetch phenotype labels from GEO → because you need COPD/control labels for DE
+
+
+*#Get the real sample metadata from GEO*
+What we’re doing
+  We’re pulling the official GEO “phenotype” table for GSE76925 (the sample annotations).
+
+Why we’re doing it
+  Because differential expression needs labels (COPD vs control) and ideally covariates (age/sex/smoking). Your expression matrix currently has none of that. 
+  
+```{r}
+library(GEOquery)
+
+gse <- getGEO("GSE76925", GSEMatrix = TRUE)
+eset <- gse[[1]]
+pheno <- pData(eset)
+
+dim(pheno)
+colnames(pheno)[1:20]
+head(pheno[, 1:10])
+
+```
+```{r}
+#Step 1 — Confirm sample counts match
+
+#What we are checking:If the number of expression columns equals number of metadata rows.
+#Why:If they match, then order-based mapping is valid.
+
+ncol(expr_log)
+nrow(pheno)
+
+
+#Step 2 — Map expression columns to GSM IDs
+
+#What we are doing: We replace generic names (sample1) with actual GSM IDs.
+#Why: So every expression column corresponds to real biological sample IDs.
+
+colnames(expr_log) <- pheno$geo_accession
+head(colnames(expr_log))
+
+#Step 3 — Create disease status variable
+
+#What we are doing: Extract case vs control from title.
+#Why: Differential expression requires a design matrix.
+
+
+group <- ifelse(grepl("case", pheno$title, ignore.case = TRUE), 
+                "COPD", "Control")
+
+table(group)
+
+#Create a factor:
+group <- factor(group, levels = c("Control", "COPD"))
+
+# Step 4 — Why this is important?
+cat("It ensured that expression columns were correctly mapped to GEO sample IDs before assigning disease status. Misalignment between phenotype and expression data is a common source of downstream analytical errors, so I verified counts and mapping before proceeding.")
+
+```
+
+*# PCA (Unsupervised Check)*
+What we are doing
+  Principal Component Analysis on samples.
+Why
+  ->Do COPD samples separate from controls?
+  ->Are there outliers?
+  ->Is there strong global structure?
+=>If PCA already separates groups, that’s powerful biological signal.
+
+```{r}
+pca <- prcomp(t(expr_log), scale. = TRUE)
+
+pca_df <- data.frame(
+  PC1 = pca$x[,1],
+  PC2 = pca$x[,2],
+  group = group
+)
+
+library(ggplot2)
+
+ggplot(pca_df, aes(PC1, PC2, color = group)) +
+  geom_point(size = 4, alpha = 0.8) +
+  stat_ellipse(aes(fill = group), geom = "polygon", alpha = 0.1, linetype = "dashed") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),   # centered title
+    axis.title = element_text(face = "bold"),                           # bold axis labels
+    legend.title = element_text(face = "bold"),                         # bold legend title
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    plot.background = element_rect(fill = "white", color = NA)
+  ) +
+  labs(
+    title = "PCA of Lung Tissue Expression (GSE76925)",
+    x = "PC1",
+    y = "PC2",
+    color = "Group"
+  )
+
+
+cat("The PCA shows partial separation but substantial overlap between COPD and controls, suggesting that while disease-related transcriptional shifts exist, COPD exhibits considerable molecular heterogeneity. The increased dispersion in COPD samples may reflect underlying biological subtypes.”")
+
+summary(pca)$importance[2, 1:5]
+
+cat("\n\nAlthough COPD and control samples show partial separation, the dominant variance axis (PC1, ~64%) does not appear to correspond directly to disease status. This suggests that other biological or technical factors contribute substantially to transcriptional variability. The broader dispersion among COPD samples may reflect disease heterogeneity or differences in inflammatory or tissue-remodeling signatures.")
+```
+
+## PCA-NOSCALE 
+I re-ran PCA without gene scaling because z-scaling across genes forces each probe to have equal variance, which can over-weight low-variance or noisy probes in transcriptomic data. For microarray expression analysis, log-transformation is typically sufficient, and PCA without scaling preserves the natural variance structure across genes.
+```{r}
+
+pca_noscale <- prcomp(t(expr_log), center = TRUE, scale. = FALSE)
+
+pca_df2 <- data.frame(
+  PC1 = pca_noscale$x[,1],
+  PC2 = pca_noscale$x[,2],
+  group = group
+)
+
+summary(pca_noscale)$importance[2, 1:5]
+
+library(ggplot2)
+
+# (Recreate the plotting data frame if needed)
+pca_df2 <- data.frame(
+  PC1 = pca_noscale$x[, 1],
+  PC2 = pca_noscale$x[, 2],
+  group = group
+)
+
+ggplot(pca_df2, aes(PC1, PC2, color = group)) +
+  geom_point(size = 3, alpha = 0.9) +
+  stat_ellipse(aes(fill = group), geom = "polygon", alpha = 0.12, linetype = 2) +
+  theme_minimal() +
+  labs(title = "PCA (no scaling) — GSE76925", x = "PC1", y = "PC2")
+
+```
+
+
+### Does PC1 significantly differ between COPD and Control?
+  That tells us whether the dominant variance axis reflects disease.
+  
+```{r}
+
+#Step 1 — Extract PC1 scores
+pca_noscale$x
+pc1_scores <- pca_noscale$x[, 1] #So extract PC1:
+
+#Step 2 — Compare PC1 between groups
+#We do a simple t-test, Why a t-test? Because: PC1 is continuous, group is binary (COPD vs Control), we are testing mean difference
+
+t.test(pc1_scores ~ group)
+
+#Step 3 — Visualize it 
+library(ggplot2)
+
+df_pc1 <- data.frame(
+  PC1 = pc1_scores,
+  group = group
+)
+
+ggplot(df_pc1, aes(group, PC1, fill = group)) +
+  geom_boxplot(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "PC1 Distribution by Disease Status")
+
+```
+
+### Does PC2 significantly differ between COPD and Control?
+```{r}
+#Step 1 — Extract PC1 scores
+pca_noscale$x
+pc2_scores <- pca_noscale$x[, 2] #So extract PC2:
+
+#Step 2 — Compare PC1 between groups
+#We do a simple t-test, Why a t-test? Because: PC2 is continuous, group is binary (COPD vs Control), we are testing mean difference
+
+t.test(pc2_scores ~ group)
+
+#Step 3 — Visualize it 
+library(ggplot2)
+
+df_pc2 <- data.frame(
+  PC2 = pc2_scores,
+  group = group
+)
+
+ggplot(df_pc2, aes(group, PC2, fill = group)) +
+  geom_boxplot(alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "PC2 Distribution by Disease Status")
+
+```
+
+**PCA showed that PC1 explains most variance but isn’t associated with COPD status, suggesting dominant variability is driven by other factors. However, PC2 is strongly associated with COPD (p ≈ 2.6×10⁻⁹), indicating a robust disease-related transcriptional axis despite overall heterogeneity.**
+
+Even though PC1 explains ~60% of overall variance, it’s not disease-associated (your PC1 p ≈ 0.87).
+But PC2 is disease-associated → the COPD signal is real, just not the largest source of variation in the dataset.
+
+That is super common in human lung tissue:
+
+ -> PC1 often captures big background effects (cell-type mix, batch, smoking, RNA quality, inflammation level, etc.).
+ -> PC2 can capture a more specific phenotype axis (here: COPD vs control).
+
+
+*#Differential Expression Analysis (limma)*
+What we are doing
+  We are testing, gene by gene, whether expression differs between COPD and Control.
+
+Why we are doing it
+  ->PCA tells us global structure.
+  ->limma tells us which specific genes drive disease differences.
+
+This is the step that produces candidate biomarkers.
+
+```{r}
+library(limma)
+
+# Step 1 — Build the design matrix
+design <- model.matrix(~ group)
+
+colnames(design)
+head(design)
+
+# Step 2 — Fit gene-wise linear models
+fit <- lmFit(expr_log, design)
+
+# Step 3 — Apply empirical Bayes moderation
+fit <- eBayes(fit)
+
+# Step 4 — Extract results for COPD effect
+results <- topTable(
+  fit,
+  coef = "groupCOPD",
+  number = Inf,
+  adjust.method = "BH"
+)
+
+head(results)
+
+# Step 5 — Count significant genes
+sum(results$adj.P.Val < 0.05)
+
+library(ggplot2)
+
+results$significant <- results$adj.P.Val < 0.05
+
+ggplot(results, aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(aes(color = significant), alpha = 0.7, size = 2.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray40", linewidth = 0.7) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "gray40", linewidth = 0.7) +
+  scale_color_manual(
+    values = c("FALSE" = "steelblue", "TRUE" = "firebrick"),
+    labels = c("FALSE" = "Not Significant", "TRUE" = "Significant")
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title   = element_text(hjust = 0.5, face = "bold", size = 16),   # centered title
+    axis.title   = element_text(face = "bold"),                           # bold axis labels
+    legend.title = element_text(face = "bold"),                           # bold legend title
+    legend.position = "right",
+    panel.grid.minor = element_blank(),
+    plot.background  = element_rect(fill = "white", color = NA)
+  ) +
+  labs(
+    title = "Differential Expression — COPD vs Control",
+    x     = "Log2 Fold Change",
+    y     = "-log10(FDR)",
+    color = "Significance"
+  )
+
+#Identify Top Up- and Down-Regulated Genes
+
+top_up   <- results[results$logFC > 0 & results$adj.P.Val < 0.05, ][1:10, ]
+top_down <- results[results$logFC < 0 & results$adj.P.Val < 0.05, ][1:10, ]
+
+top_up
+top_down
+
+cat("I performed limma differential expression modelling using COPD status as the predictor. After empirical Bayes moderation and FDR correction, I identified 1812 genes significantly associated with COPD. The volcano plot demonstrated both upregulated and downregulated transcriptional programs, consistent with widespread molecular remodeling in diseased lung tissue.")
+
+```
+**After QC and PCA exploration, I performed supervised differential expression using limma. I modeled gene expression as a function of COPD status, applied empirical Bayes moderation, controlled FDR using Benjamini-Hochberg, and identified significantly dysregulated genes associated with COPD.**
+
+# After differential expression, we mapped probe IDs to gene symbols and performed Gene Ontology enrichment. The COPD signature was enriched for inflammatory and extracellular matrix remodeling pathways, consistent with chronic lung injury and tissue remodeling.
+
+## Step 1 — Make a strong DE gene list 
+
+```{r}
+# What we're doing: keep genes with FDR + decent effect size
+# Why: avoids “statistically significant but tiny” changes
+
+sig_strong <- results[results$adj.P.Val < 0.05 & abs(results$logFC) > 0.5, ]
+
+nrow(sig_strong)
+head(sig_strong)
+
+```
+
+## Step 2 - Add ProbeID column
+  
+```{r}
+# What we’re doing: Convert rownames (ILMN_...) into an explicit column.
+# Why: We need ProbeID to merge with annotation tables.
+
+sig_strong$ProbeID <- rownames(sig_strong)
+head(sig_strong$ProbeID)
+```
+
+## Step 3 — Get Illumina platform annotation (GPL10558) and build a clean map
+
+IMPORTANT: Use Symbol (not ILMN_Gene). And also grab Entrez_Gene_ID directly (more robust).
+
+```{r}
+
+library(GEOquery)
+library(dplyr)
+
+gpl <- getGEO("GPL10558")
+gpl_tab <- Table(gpl)
+
+# Build mapping table
+annot_map <- gpl_tab %>%
+  transmute(
+    ProbeID  = as.character(ID),
+    SYMBOL   = as.character(Symbol),
+    ENTREZID = as.character(Entrez_Gene_ID)
+  )
+
+# Clean up symbol + entrez
+annot_map$SYMBOL   <- trimws(annot_map$SYMBOL)
+annot_map$ENTREZID <- trimws(annot_map$ENTREZID)
+
+annot_map$SYMBOL[annot_map$SYMBOL %in% c("", "NA")] <- NA
+annot_map$ENTREZID[annot_map$ENTREZID %in% c("", "NA")] <- NA
+
+# If SYMBOL contains multi-maps like "A /// B" or "A;B", keep first
+annot_map$SYMBOL <- sub("///.*$", "", annot_map$SYMBOL)
+annot_map$SYMBOL <- sub(";.*$",   "", annot_map$SYMBOL)
+annot_map$SYMBOL <- trimws(annot_map$SYMBOL)
+
+head(annot_map)
+sum(!is.na(annot_map$SYMBOL))
+sum(!is.na(annot_map$ENTREZID))
+
+```
+## Step 4 — Merge annotation into your limma results
+
+```{r}
+
+annotated <- sig_strong %>%
+  left_join(annot_map, by = "ProbeID")
+
+# sanity checks
+head(annotated[, c("ProbeID","SYMBOL","ENTREZID","logFC","adj.P.Val")])
+mean(!is.na(annotated$SYMBOL))
+mean(!is.na(annotated$ENTREZID))
+table(is.na(annotated$SYMBOL))
+
+```
+If mean(!is.na(annotated$SYMBOL)) is low (<0.7), we can still proceed using ENTREZIDs if those map well.
+
+## Step 5 — Create clean Up/Down gene lists (Entrez-first, because enrichment loves it)
+```{r}
+
+# Upregulated in COPD
+entrez_up <- annotated %>%
+  filter(logFC > 0) %>%
+  pull(ENTREZID) %>%
+  na.omit() %>%
+  unique()
+
+# Downregulated in COPD
+entrez_down <- annotated %>%
+  filter(logFC < 0) %>%
+  pull(ENTREZID) %>%
+  na.omit() %>%
+  unique()
+
+length(entrez_up)
+length(entrez_down)
+head(entrez_up)
+head(entrez_down)
+
+```
+
+## Step 6 — Install clusterProfiler correctly (Bioconductor, not CRAN)
+```{r}
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+for (p in c("clusterProfiler", "org.Hs.eg.db", "enrichplot")) {
+  if (!requireNamespace(p, quietly = TRUE)) {
+    BiocManager::install(p, ask = FALSE, update = FALSE)
+  }
+}
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+
+```
+
+
+## Step 7 — GO Enrichment (Up genes)
+```{r}
+
+if (length(entrez_up) < 10) stop("Too few upregulated genes for enrichment. Relax thresholds.")
+
+ego_up <- enrichGO(
+  gene          = entrez_up,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+head(as.data.frame(ego_up))
+
+```
+
+## Step 8 — GO Enrichment (Down genes)
+```{r}
+if (length(entrez_down) < 10) stop("Too few downregulated genes for enrichment. Relax thresholds.")
+
+ego_down <- enrichGO(
+  gene          = entrez_down,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+head(as.data.frame(ego_down))
+
+```
+
+## Step 9 — Plot enrichment
+
+```{r}
+library(ggplot2)
+
+# Upregulated GO dotplot
+dotplot(ego_up, showCategory = 15) +
+  ggtitle("GO BP — Upregulated in COPD") +
+  theme(
+    plot.title   = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title   = element_text(face = "bold"),
+    axis.text.y  = element_text(face = "bold", size = 10),
+    axis.text.x  = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# Downregulated GO dotplot
+dotplot(ego_down, showCategory = 15) +
+  ggtitle("GO BP — Downregulated in COPD") +
+  theme(
+    plot.title   = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title   = element_text(face = "bold"),
+    axis.text.y  = element_text(face = "bold", size = 10),
+    axis.text.x  = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+## Step 10 — Save outputs 
+```{r}
+
+write.csv(annotated, "limma_sig_strong_annotated.csv", row.names = FALSE)
+write.csv(as.data.frame(ego_up), "GO_up_COPD.csv", row.names = FALSE)
+write.csv(as.data.frame(ego_down), "GO_down_COPD.csv", row.names = FALSE)
+
+```
+
+# Visual QC of Differential Expression (Volcano + MA plot)
+
+What we are doing
+ We’re checking if the limma results behave like real biology:
+  ->Volcano plot: effect size vs significance
+  ->MA plot: mean expression vs logFC
+
+Why we are doing it
+ If you see weird shapes (e.g., everything significant, or only low-expression genes), it often means:
+  ->mapping issues
+  ->normalization issues
+  ->hidden batch/covariate effects
+  
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Ensure results has ProbeID
+res_df <- results %>%
+  mutate(ProbeID = rownames(results),
+         negLog10P = -log10(P.Value),
+         sig = adj.P.Val < 0.05 & abs(logFC) > 0.5)
+
+# Volcano
+ggplot(res_df, aes(x = logFC, y = negLog10P)) +
+  geom_point(aes(alpha = sig), size = 1.2) +
+  theme_minimal(base_size = 13) +
+  labs(title = "Volcano Plot (COPD vs Control)",
+       x = "log2 Fold Change",
+       y = "-log10(p-value)") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+# MA plot
+ggplot(res_df, aes(x = AveExpr, y = logFC)) +
+  geom_point(aes(alpha = sig), size = 1.2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_minimal(base_size = 13) +
+  labs(title = "MA Plot (COPD vs Control)",
+       x = "Average Expression",
+       y = "log2 Fold Change") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+
+
+# Heatmap of Top COPD Signature Genes
+What we are doing
+ We’ll visualise the top differentially expressed genes across all samples.
+
+Why we are doing it
+ A heatmap shows:
+  ->whether samples cluster by COPD vs Control
+  ->whether the “signature” is consistent or noisy
+  ->whether outliers exist
+
+```{r}
+# We'll use pheatmap for a clean heatmap
+if (!requireNamespace("pheatmap", quietly = TRUE)) install.packages("pheatmap")
+library(pheatmap)
+
+# Pick top genes by FDR
+topN <- 50
+top_probes <- rownames(results[order(results$adj.P.Val), ])[1:topN]
+
+# expr_log should already exist (genes x samples, log2 transformed)
+mat_top <- expr_log[top_probes, ]
+
+# Z-score per gene for heatmap visibility
+mat_z <- t(scale(t(mat_top)))
+
+ann_col <- data.frame(Group = group)
+rownames(ann_col) <- colnames(mat_z)
+
+pheatmap(
+  mat_z,
+  annotation_col = ann_col,
+  show_colnames = FALSE,
+  fontsize_row = 7,
+  main = paste("Top", topN, "DE Probes (Z-scored)")
+)
+```
+
+# Check whether the “COPD signal” is driven by a covariate (optional but smart)
+What we are doing
+ We inspect GEO phenotype columns (age/sex/smoking, etc.) and see if they align with PC1/PC2 or with group imbalance.
+
+Why we are doing it
+  ->Your PCA already said: PC1 is not COPD, PC2 is COPD.
+  ->That screams: “PC1 might be smoking, batch, tissue quality, cell composition, etc.”
+  
+```{r}
+# Quick scan for useful phenotype fields
+colnames(pheno)
+
+# Look at characteristics fields (GEO often stores info here)
+pheno %>%
+  dplyr::select(title, geo_accession, dplyr::starts_with("characteristics")) %>%
+  head(10)
+
+# Example: check if any characteristics correlate with PC1 (if numeric exists)
+# (You'll customise once you see what columns exist.)
+```
+  
+# Pathway Enrichment beyond GO (Reactome is usually cleaner)
+What we are doing
+ Run Reactome pathway enrichment on up/down genes.
+
+Why we are doing it
+ Reactome pathways are often more interpretable than GO terms for disease biology.
+ 
+```{r}
+# Reactome enrichment uses Entrez IDs
+if (!requireNamespace("ReactomePA", quietly = TRUE)) BiocManager::install("ReactomePA", ask = FALSE, update = FALSE)
+library(ReactomePA)
+
+react_up <- enrichPathway(
+  gene = entrez_up,
+  organism = "human",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+react_down <- enrichPathway(
+  gene = entrez_down,
+  organism = "human",
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+head(as.data.frame(react_up))
+head(as.data.frame(react_down))
+
+dotplot(react_up, showCategory = 15) + ggtitle("Reactome — Up in COPD")
+dotplot(react_down, showCategory = 15) + ggtitle("Reactome — Down in COPD")
+```
+### Diagnostic: how many genes actually go into Reactome DOWN? 
+```{r}
+
+length(genes_down)
+
+entrez_down <- bitr(
+  genes_down,
+  fromType = "SYMBOL",
+  toType   = "ENTREZID",
+  OrgDb    = org.Hs.eg.db
+)
+
+nrow(entrez_down)            # how many mapped
+length(unique(entrez_down$ENTREZID))
+head(entrez_down)
+```
+
+# GSEA — Reactome (Ranked Analysis)
+What we are doing
+ We rank all genes by limma t-statistic and perform enrichment without arbitrary cutoffs.
+Why
+ ->Over-representation can miss coordinated but subtle pathway shifts.
+ ->GSEA is more sensitive and biologically robust.
+```{r}
+# Create ranked gene list (by limma t-statistic)
+# Create ranked gene list (by limma t-statistic)
+gene_list <- results$t
+
+# Use FULL mapping from GPL (not sig-only "annotated")
+entrez_map_full <- annot_map %>%
+  dplyr::select(ProbeID, ENTREZID) %>%
+  dplyr::filter(!is.na(ENTREZID))
+
+names(gene_list) <- entrez_map_full$ENTREZID[match(rownames(results), entrez_map_full$ProbeID)]
+
+# Clean
+gene_list <- gene_list[is.finite(gene_list)]
+gene_list <- gene_list[!is.na(names(gene_list))]
+gene_list <- sort(gene_list, decreasing = TRUE)
+gene_list <- gene_list[!duplicated(names(gene_list))]
+
+# sanity
+all(diff(gene_list) <= 0)
+length(gene_list)
+head(gene_list)
+```
+## Pre-GSEA Sanity Checks (Add to RMD)
+
+```{r}
+#Step 1 — Check structure
+
+head(gene_list)
+length(gene_list)
+summary(gene_list)
+
+```
+
+
+```{r}
+# Step 2 — Ensure sorted
+# TRUE means it's already sorted decreasing
+is_sorted_decreasing <- all(diff(gene_list) <= 0, na.rm = TRUE)
+is_sorted_decreasing
+
+all(diff(gene_list) <= 0, na.rm = TRUE)
+
+```
+
+```{r}
+#Quick full “pre-GSEA clean” block
+# Make sure it's numeric and named
+stopifnot(is.numeric(gene_list))
+stopifnot(!is.null(names(gene_list)))
+
+# Drop NA/Inf
+gene_list <- gene_list[is.finite(gene_list)]
+
+# Ensure names are characters (Entrez IDs)
+names(gene_list) <- as.character(names(gene_list))
+
+# Remove duplicates (keep first / best-ranked after sorting)
+gene_list <- sort(gene_list, decreasing = TRUE)
+gene_list <- gene_list[!duplicated(names(gene_list))]
+
+# Final check: sorted decreasing?
+all(diff(gene_list) <= 0, na.rm = TRUE)
+
+```
+
+
+# Run Reactome GSEA (ranked enrichment)
+What we’re doing
+ We’re running rank-based pathway enrichment using the full limma signal (t-stat ranking), not just “sig genes”.
+
+Why
+ ORA (enrichPathway) depends on an arbitrary cutoff. GSEA catches coordinated shifts even if single genes aren’t extreme.
+ 
+
+```{r}
+
+# Install if missing
+if (!requireNamespace("ReactomePA", quietly = TRUE)) {
+  BiocManager::install("ReactomePA", ask = FALSE, update = FALSE)
+}
+if (!requireNamespace("enrichplot", quietly = TRUE)) {
+  BiocManager::install("enrichplot", ask = FALSE, update = FALSE)
+}
+
+library(ReactomePA)
+library(enrichplot)
+
+# GSEA (Reactome) using ranked t-stat list
+gsea_reactome <- gsePathway(
+  geneList      = gene_list,     # named numeric vector: names = EntrezID
+  organism      = "human",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  verbose       = FALSE
+)
+
+# View results
+head(as.data.frame(gsea_reactome))
+```
+## Plot GSEA results
+```{r}
+
+# If no significant pathways, don't crash
+if (is.null(gsea_reactome) || nrow(as.data.frame(gsea_reactome)) == 0) {
+  cat("No significant Reactome GSEA pathways at FDR < 0.05.\nTry pvalueCutoff=0.1 or check mapping.\n")
+} else {
+  dotplot(gsea_reactome, showCategory = 15) +
+    ggtitle("Reactome GSEA — Ranked by limma t-stat") +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+}
+```
+
+
+
+## Look at top positive vs negative pathways (core interpretation)
+
+```{r}
+gsea_df <- as.data.frame(gsea_reactome)
+
+# Top positively enriched (COPD side, depending on your ranking direction)
+head(gsea_df[order(gsea_df$p.adjust), 
+             c("ID","Description","NES","p.adjust","core_enrichment")], 10)
+
+# Strongest positive NES
+head(gsea_df[order(-gsea_df$NES), c("Description","NES","p.adjust")], 10)
+
+# Strongest negative NES
+head(gsea_df[order(gsea_df$NES),  c("Description","NES","p.adjust")], 10)
+
+```
+
+
+## Plot an enrichment curve for ONE pathway (most convincing figure)
+
+```{r}
+
+# Pick the top pathway by adjusted p-value
+top_path <- as.data.frame(gsea_reactome)$ID[1]
+
+# Enrichment curve
+gseaplot2(gsea_reactome, geneSetID = top_path, title = as.data.frame(gsea_reactome)$Description[1])
+
+```
+
+# Final Step 1 — Extract top enriched pathways with NES
+```{r}
+gsea_df <- as.data.frame(gsea_reactome)
+
+gsea_df %>%
+  dplyr::arrange(p.adjust) %>%
+  dplyr::select(Description, NES, p.adjust) %>%
+  head(10)
+
+```
+
+# Final Step 2 — Write Final Biological Summary
+
+Based on everything you’ve shown so far, your COPD signature likely has:
+
+ Upregulated:
+  ->ECM organization
+  ->Collagen degradation
+  ->Integrin interactions
+  ->ROBO signaling
+  ->Inflammatory pathways
+
+ Downregulated:
+  ->RNA splicing
+  ->Ribosomal biogenesis
+  ->Translation machinery
+
+*That is a very clean disease pattern:Chronic tissue remodeling + immune activation + suppression of normal epithelial biosynthetic programs.*
+---
+*Rank-based Reactome GSEA revealed coordinated enrichment of tissue remodeling and SLIT–ROBO signaling pathways among genes upregulated in COPD lung tissue, consistent with structural reorganization and altered epithelial–stromal interactions. In contrast, multiple translational and ribosomal biogenesis pathways were enriched at the downregulated end of the ranked list, indicating suppression of core protein synthesis and RNA processing programs. Together, these findings suggest that COPD is characterized by a shift from normal epithelial biosynthetic activity toward chronic remodeling and stress-associated signaling programs.*

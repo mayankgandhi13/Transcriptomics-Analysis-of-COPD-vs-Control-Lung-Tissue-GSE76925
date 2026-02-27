@@ -1,0 +1,815 @@
+---
+title: "Transcriptomics Analysis of COPD vs Control Lung Tissue (GSE76925, Illumina HumanHT-12 v4)"
+author: "Mayank Gandhi"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: readable
+---
+
+**This study presents a comprehensive transcriptomic analysis of lung tissue from individuals with chronic obstructive pulmonary disease (COPD) compared to controls using the GEO dataset GSE76925. After quality control filtering based on probe detection p-values and log2 transformation of intensities, unsupervised principal component analysis revealed structured transcriptional variation across samples. While the dominant variance axis (PC1) was not directly associated with disease status, a secondary axis (PC2) demonstrated significant separation between COPD and control groups, suggesting the presence of a robust but heterogeneous disease-associated transcriptional signal.**
+
+**Supervised differential expression modelling using limma with empirical Bayes moderation identified widespread gene dysregulation in COPD lung tissue. Pathway-level analysis through Gene Ontology, Reactome over-representation analysis, and rank-based Gene Set Enrichment Analysis (GSEA) consistently highlighted coordinated upregulation of extracellular matrix remodeling and SLIT–ROBO signaling pathways, alongside downregulation of translational and ribosomal biogenesis programs. Together, these findings indicate that COPD is characterised not by isolated gene-level perturbations but by systematic reprogramming of structural and biosynthetic pathways, consistent with chronic tissue injury and airway remodeling.**
+
+```{r setup, include=FALSE}
+
+set.seed(13) # Reproducibility
+
+# Knitr behaviour
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.width = 9,
+  fig.height = 5
+)
+
+options(stringsAsFactors = FALSE)
+
+```
+
+# Step A — Load packages and import expression matrix
+
+This notebook analyses the microarray dataset **GSE76925** (COPD vs control lung tissue).  
+The raw file includes two types of columns:
+
+- **Intensity columns** (expression values)
+- **Detection p-value columns** (Illumina probe-level detection calls, used for filtering)
+
+## Step A.1 — Install (if needed) and load required packages
+
+```{r}
+# CRAN + Bioconductor package helper
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+load_or_install <- function(pkgs, bioc = FALSE) {
+  for (p in pkgs) {
+    if (!requireNamespace(p, quietly = TRUE)) {
+      if (bioc) BiocManager::install(p, ask = FALSE, update = FALSE) else install.packages(p)
+    }
+    suppressPackageStartupMessages(library(p, character.only = TRUE))
+  }
+}
+
+if (!requireNamespace("pheatmap", quietly = TRUE)) install.packages("pheatmap")
+
+# CRAN packages
+load_or_install(c("tidyverse", "data.table", "pheatmap"))
+
+# Bioconductor packages
+load_or_install(c("GEOquery", "limma", "clusterProfiler", "org.Hs.eg.db", "enrichplot", "ReactomePA"),
+                bioc = TRUE)
+```
+
+## Step A.2 — Read the expression file
+
+```{r}
+# Read gz file directly
+expr_raw <- read.delim(
+  "GSE76925_non-normalized (2).txt.gz",
+  header = TRUE,
+  sep = "\t",
+  check.names = FALSE
+)
+
+dim(expr_raw)
+head(expr_raw[, 1:6])
+```
+
+**Interpretation:** columns such as `sample1` are intensities; columns such as `sample1.Detection.Pval` are QC flags for that probe in that sample.
+
+## Step A.3 — Split intensities vs detection p-values
+
+**What we do:** separate the raw table into two matrices.
+
+**Why it matters:** detection p-values are not expression. If you leave them in the expression matrix, PCA, differential expression, and clustering become meaningless.
+
+```{r}
+# Expression columns are those NOT ending in ".Detection.Pval"
+expr_mat <- expr_raw[, !grepl("Detection\\.Pval$", colnames(expr_raw)), drop = FALSE]
+
+# Detection p-value columns DO end in ".Detection.Pval"
+detp_mat <- expr_raw[, grepl("Detection\\.Pval$", colnames(expr_raw)), drop = FALSE]
+
+# Sanity checks
+dim(expr_mat)
+dim(detp_mat)
+
+head(colnames(expr_mat), 6)
+head(colnames(detp_mat), 6)
+```
+
+# Step B — QC filtering and transformation
+
+## Step B.1 — Filter probes that are rarely detected
+
+**What we do:** keep probes detected (detection p-value < 0.01) in at least 20% of samples.
+
+**Why it matters:** microarrays include probes that are effectively noise in a given tissue. Keeping them inflates the multiple testing burden and adds noise to PCA and modelling.
+
+```{r}
+detected <- detp_mat < 0.01
+keep <- rowMeans(detected, na.rm = TRUE) >= 0.20
+
+expr_f <- expr_mat[keep, , drop = FALSE]
+dim(expr_f)
+```
+
+## Step B.2 — Log2 transform intensities
+
+**What we do:** `log2(x + 1)`.
+
+**Why it matters:** intensities are right-skewed and variance increases with the mean. Log transformation stabilises variance and improves linear modelling assumptions.
+
+```{r}
+expr_log <- log2(expr_f + 1)
+summary(as.vector(expr_log))
+```
+
+# Step C — Download GEO sample metadata and define COPD status
+
+Differential expression needs phenotype labels (COPD vs control). We pull these from GEO.
+
+## Step C.1 — Download GEO metadata and extract the phenotype table
+
+```{r}
+gse <- getGEO("GSE76925", GSEMatrix = TRUE)
+eset <- gse[[1]]
+pheno <- pData(eset)
+
+dim(pheno)
+colnames(pheno)[1:20]
+head(pheno[, 1:10])
+```
+
+## Step C.2 — Confirm sample counts and align sample IDs
+
+**Goal:** make sure expression columns and phenotype rows refer to the same samples.
+
+```{r}
+ncol(expr_log)
+nrow(pheno)
+
+# Replace generic column names with GSM IDs from GEO
+colnames(expr_log) <- pheno$geo_accession
+head(colnames(expr_log))
+```
+
+## Step C.3 — Create the COPD vs control grouping variable
+
+**Approach used here:** parse the `title` field.
+
+If your dataset uses a different text pattern, change the `grepl()` rule (this is the only fragile part).
+
+```{r}
+group <- ifelse(grepl("case", pheno$title, ignore.case = TRUE), "COPD", "Control")
+table(group)
+
+group <- factor(group, levels = c("Control", "COPD"))
+```
+
+# Step D — Exploratory PCA (unsupervised)
+
+PCA is a sanity check: it tells you whether samples cluster by phenotype, whether outliers exist, and whether the main variance is disease-related or driven by other effects.
+
+## Step D.1 — PCA with scaling across genes
+
+Scaling makes each probe contribute equally. This can help sometimes, but it can also over-weight noisy probes.
+
+```{r}
+pca_scaled <- prcomp(t(expr_log), center = TRUE, scale. = TRUE)
+
+pca_df <- data.frame(
+  PC1 = pca_scaled$x[, 1],
+  PC2 = pca_scaled$x[, 2],
+  group = group
+)
+
+ggplot(pca_df, aes(PC1, PC2, colour = group)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(aes(fill = group), geom = "polygon", alpha = 0.10, linetype = 2) +
+  theme_minimal(base_size = 13) +
+  labs(title = "PCA (scaled) - GSE76925", x = "PC1", y = "PC2", colour = "Group") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+cat(
+  "Interpretation (PCA — scaled):\n",
+  "- Each point is one sample; distance between points reflects overall transcriptomic similarity.\n",
+  "- PC1 and PC2 are the top two axes of variation in the dataset.\n",
+  "- If COPD and Control form visibly different clusters, that suggests a strong disease-driven expression signal.\n",
+  "- If they overlap heavily, the disease signal is weaker than other factors (e.g., batch effects, smoking status, cell-type composition).\n",
+  "- Outliers far from the main cloud may indicate technical artefacts or biologically distinct samples.\n",
+  sep = ""
+)
+```
+
+## Step D.2 — PCA without scaling across genes
+
+No scaling preserves the natural variance structure across genes, which is often reasonable for log-transformed microarray data.
+
+```{r}
+pca_noscale <- prcomp(t(expr_log), center = TRUE, scale. = FALSE)
+
+pca_df2 <- data.frame(
+  PC1 = pca_noscale$x[, 1],
+  PC2 = pca_noscale$x[, 2],
+  group = group
+)
+
+ggplot(pca_df2, aes(PC1, PC2, colour = group)) +
+  geom_point(size = 3, alpha = 0.85) +
+  stat_ellipse(aes(fill = group), geom = "polygon", alpha = 0.12, linetype = 2) +
+  theme_minimal(base_size = 13) +
+  labs(title = "PCA (no scaling) - GSE76925", x = "PC1", y = "PC2", colour = "Group") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+cat(
+  "Interpretation (PCA — no scaling):\n",
+  "- This PCA keeps genes at their natural variance levels (high-variance genes influence PCs more).\n",
+  "- Often more realistic for microarrays because it preserves dominant biological variation.\n",
+  "- If separation improves here compared with the scaled PCA, it suggests a smaller subset of high-variance genes drives group structure.\n",
+  "- If separation worsens, scaling may have helped expose subtle disease signal.\n",
+  sep = ""
+)
+
+```
+
+## Step D.3 — Test whether PCs differ by COPD status
+
+These tests help confirm whether disease status aligns with a major variance axis.
+
+```{r}
+pc1_scores <- pca_noscale$x[, 1]
+pc2_scores <- pca_noscale$x[, 2]
+
+t.test(pc1_scores ~ group)
+t.test(pc2_scores ~ group)
+
+df_pc1 <- data.frame(PC1 = pc1_scores, group = group)
+df_pc2 <- data.frame(PC2 = pc2_scores, group = group)
+
+ggplot(df_pc1, aes(group, PC1, fill = group)) +
+  geom_boxplot(alpha = 0.6) +
+  theme_minimal(base_size = 13) +
+  labs(title = "PC1 by group (no scaling)", x = NULL, y = "PC1") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "none")
+
+cat(
+  "Interpretation (PC1 by group):\n",
+  "- This tests whether the main axis of variation (PC1) differs between COPD and Control.\n",
+  "- A non-significant p-value means PC1 is likely driven by non-disease factors (e.g., technical batch, tissue composition, smoking).\n",
+  "- A significant p-value suggests COPD status contributes strongly to global variation in expression.\n",
+  sep = ""
+)
+
+ggplot(df_pc2, aes(group, PC2, fill = group)) +
+  geom_boxplot(alpha = 0.6) +
+  theme_minimal(base_size = 13) +
+  labs(title = "PC2 by group (no scaling)", x = NULL, y = "PC2") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.position = "none")
+
+cat(
+  "\n\nInterpretation (PC2 by group):\n",
+  "- This tests whether the second major axis (PC2) is associated with COPD status.\n",
+  "- A significant p-value here implies a robust disease-related transcriptional axis, even if PC1 is dominated by other factors.\n",
+  "- This is common in human lung datasets where cell mixture/batch drives PC1 and disease signal appears on PC2 or PC3.\n",
+  sep = ""
+)
+
+```
+
+# Step E — Differential expression with limma
+
+We model each probe as a function of COPD status. *limma fits linear models efficiently and uses empirical Bayes shrinkage for stable inference.*
+
+## Step E.1 — Fit limma model
+
+```{r}
+design <- model.matrix(~ group)
+colnames(design)
+
+fit <- lmFit(expr_log, design)
+fit <- eBayes(fit)
+
+results <- topTable(
+  fit,
+  coef = "groupCOPD",
+  number = Inf,
+  adjust.method = "BH"
+)
+
+head(results)
+sum(results$adj.P.Val < 0.05)
+```
+## Step E.2 Heatmap of top DE probes
+```{r}
+# Visualising the top differentially expressed probes across samples
+library(pheatmap)
+library(RColorBrewer)
+
+topN       <- 50
+top_probes <- rownames(results[order(results$adj.P.Val), ])[1:topN]
+mat_top    <- expr_log[top_probes, , drop = FALSE]
+mat_z      <- t(scale(t(mat_top)))  # z-score per gene
+
+# Annotation
+ann_col <- data.frame(Group = group)
+rownames(ann_col) <- colnames(mat_z)
+
+# Custom colors
+ann_colors <- list(
+  Group = c(COPD = "firebrick", Control = "steelblue")  # adjust names to match your group levels
+)
+
+pheatmap(
+  mat_z,
+  annotation_col  = ann_col,
+  annotation_colors = ann_colors,
+  color           = colorRampPalette(rev(brewer.pal(9, "RdBu")))(100),
+  show_colnames   = FALSE,
+  show_rownames   = TRUE,
+  fontsize_row    = 7,
+  fontsize        = 11,
+  border_color    = NA,                      # removes grid lines between cells
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method        = "complete",
+  main            = paste("Top", topN, "DE Probes (Z-scored)"),
+  treeheight_row  = 30,
+  treeheight_col  = 30
+)
+
+cat(
+  "Interpretation (Heatmap of top DE probes):\n",
+  "- Rows are the top differentially expressed probes/genes; columns are samples.\n",
+  "- Values are z-scored per gene (row-wise), so colours show relative up/down expression within each gene.\n",
+  "- Separation of COPD vs Control in clustering suggests a coherent disease signature.\n",
+  "- Mixed clustering suggests heterogeneity or confounding effects.\n",
+  "- Isolated samples may be outliers and should be checked in PCA/QC.\n",
+  sep = ""
+)
+```
+## Step E.3 — Volcano and MA plots (visual QC)
+
+```{r}
+res_df <- results %>%
+  dplyr::mutate(
+    ProbeID = rownames(results),
+    negLog10FDR = -log10(adj.P.Val),
+    sig = adj.P.Val < 0.05 & abs(logFC) > 0.5
+  )
+
+library(ggplot2)
+
+# Volcano Plot 
+ggplot(res_df, aes(x = logFC, y = negLog10FDR)) +
+  geom_point(aes(color = sig), alpha = 0.7, size = 2) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray40", linewidth = 0.7) +
+  geom_vline(xintercept = c(-1, 1),     linetype = "dashed", color = "gray40", linewidth = 0.7) +
+  scale_color_manual(
+    values = c("FALSE" = "steelblue", "TRUE" = "firebrick"),
+    labels = c("FALSE" = "Not Significant", "TRUE" = "Significant")
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title   = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title   = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    plot.background  = element_rect(fill = "white", color = NA)
+  ) +
+  labs(
+    title = "Volcano Plot — COPD vs Control",
+    x     = "Log2 Fold Change",
+    y     = "-log10(FDR)",
+    color = "Significance"
+  )
+
+cat(
+  "Interpretation (Volcano Plot):\n",
+  "- Each point is one probe/gene.\n",
+  "- X-axis = log2 fold change (direction + magnitude of change in COPD vs Control).\n",
+  "- Y-axis = -log10(FDR), controlling for multiple testing.; higher points are more statistically significant.\n",
+  "- Points far left/right and high up are the most compelling candidates: large effect + strong significance.\n",
+  "- Dashed lines mark FDR = 0.05 (horizontal) and logFC = ±1 (vertical) cutoffs.\n",
+  "- A symmetric volcano suggests balanced up/down changes; strong skew may indicate global shifts or confounding.\n",
+  sep = ""
+)
+
+# MA Plot
+ggplot(res_df, aes(x = AveExpr, y = logFC)) +
+  geom_point(aes(color = sig), alpha = 0.7, size = 2) +
+  geom_hline(yintercept =  0, linetype = "dashed", color = "gray40", linewidth = 0.7) +
+  geom_hline(yintercept =  1, linetype = "dotted", color = "firebrick", linewidth = 0.6) +
+  geom_hline(yintercept = -1, linetype = "dotted", color = "steelblue", linewidth = 0.6) +
+  scale_color_manual(
+    values = c("FALSE" = "steelblue", "TRUE" = "firebrick"),
+    labels = c("FALSE" = "Not Significant", "TRUE" = "Significant")
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title   = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title   = element_text(face = "bold"),
+    legend.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    plot.background  = element_rect(fill = "white", color = NA)
+  ) +
+  labs(
+    title = "MA Plot — COPD vs Control",
+    x     = "Average Expression",
+    y     = "Log2 Fold Change",
+    color = "Significance"
+  )
+
+cat(
+  "Interpretation (MA Plot):\n",
+  "- Each point is a probe/gene.\n",
+  "- X-axis = average expression (mean intensity across all samples).\n",
+  "- Y-axis = log2 fold change (COPD vs Control).\n",
+  "- This checks whether fold-changes depend on expression level.\n",
+  "- A funnel shape is normal (more noise at low expression).\n",
+  "- Dotted red/blue lines mark logFC = ±1 reference cutoffs.\n",
+  "- If extreme fold-changes occur only at very low expression, results may be noise-driven.\n",
+  sep = ""
+)
+```
+
+## Step E.4 — Top hits (quick tables)
+
+```{r}
+top_up   <- results[results$logFC > 0 & results$adj.P.Val < 0.05, ][1:10, ]
+top_down <- results[results$logFC < 0 & results$adj.P.Val < 0.05, ][1:10, ]
+
+top_up
+top_down
+```
+
+# Step F — Map Illumina probe IDs to gene symbols and Entrez IDs
+
+The limma result rownames are Illumina probe IDs (for example, ILMN_1676938). Pathway tools usually expect gene symbols or Entrez IDs.
+
+## Step F.1 — Download platform annotation (GPL10558)
+
+```{r}
+gpl <- getGEO("GPL10558")
+gpl_tab <- Table(gpl)
+
+# Build a mapping table from probe -> SYMBOL and Entrez
+annot_map <- gpl_tab %>%
+  dplyr::transmute(
+    ProbeID  = as.character(ID),
+    SYMBOL   = trimws(as.character(Symbol)),
+    ENTREZID = trimws(as.character(Entrez_Gene_ID))
+  )
+
+# Clean empty strings
+annot_map$SYMBOL[annot_map$SYMBOL %in% c("", "NA")] <- NA
+annot_map$ENTREZID[annot_map$ENTREZID %in% c("", "NA")] <- NA
+
+# If SYMBOL has multiple mappings like "A /// B" or "A;B", keep the first
+annot_map$SYMBOL <- sub("///.*$", "", annot_map$SYMBOL)
+annot_map$SYMBOL <- sub(";.*$",   "", annot_map$SYMBOL)
+annot_map$SYMBOL <- trimws(annot_map$SYMBOL)
+
+head(annot_map)
+```
+
+## Step F.2 — Create an annotated results table for the strong signature
+
+**Definition used here:** FDR < 0.05 and |logFC| > 0.5.
+
+```{r}
+sig_strong <- results[results$adj.P.Val < 0.05 & abs(results$logFC) > 0.5, ]
+sig_strong$ProbeID <- rownames(sig_strong)
+
+annotated <- sig_strong %>%
+  dplyr::left_join(annot_map, by = "ProbeID")
+
+head(annotated[, c("ProbeID", "SYMBOL", "ENTREZID", "logFC", "adj.P.Val")])
+
+mean(!is.na(annotated$SYMBOL))
+mean(!is.na(annotated$ENTREZID))
+table(is.na(annotated$SYMBOL))
+```
+
+# Step G — Over-representation analysis (ORA)
+
+ORA tests whether a set of "significant" genes is enriched for pathways compared with background.
+
+## Step G.1 — Build up/down Entrez lists
+
+We use Entrez IDs because GO and Reactome tools are more robust with Entrez than symbols.
+
+```{r}
+entrez_up <- annotated %>%
+  dplyr::filter(logFC > 0) %>%
+  dplyr::pull(ENTREZID) %>%
+  na.omit() %>%
+  unique()
+
+entrez_down <- annotated %>%
+  dplyr::filter(logFC < 0) %>%
+  dplyr::pull(ENTREZID) %>%
+  na.omit() %>%
+  unique()
+
+length(entrez_up)
+length(entrez_down)
+
+head(entrez_up)
+head(entrez_down)
+```
+
+## Step G.2 — GO Biological Process enrichment
+
+```{r}
+ego_up <- enrichGO(
+  gene          = entrez_up,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+ego_down <- enrichGO(
+  gene          = entrez_down,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "ENTREZID",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+head(as.data.frame(ego_up))
+head(as.data.frame(ego_down))
+```
+
+```{r}
+dotplot(ego_up, showCategory = 15) +
+  ggtitle("GO BP - Upregulated in COPD") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+cat(
+  "Interpretation (GO BP enrichment — Upregulated in COPD):\n",
+  "- This is over-representation analysis on genes upregulated in COPD.\n",
+  "- Dot size = number of genes contributing to the term; colour = adjusted p-value (FDR).\n",
+  "- Terms related to extracellular matrix, immune activation, chemotaxis, and remodelling are biologically coherent for COPD.\n",
+  "- Highly redundant GO terms are common; focus on the consistent themes rather than individual term names.\n",
+  sep = ""
+)
+
+dotplot(ego_down, showCategory = 15) +
+  ggtitle("GO BP - Downregulated in COPD") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+cat(
+  "\n\nInterpretation (GO BP enrichment — Downregulated in COPD):\n",
+  "- This is over-representation analysis on genes downregulated in COPD.\n",
+  "- Enrichment in RNA processing, splicing, translation, or ribosome-related terms often reflects suppression of baseline biosynthetic programmes.\n",
+  "- If few terms appear, it may mean: (i) fewer down genes, (ii) weaker effect sizes, or (iii) mapping drop-outs.\n",
+  sep = ""
+)
+
+```
+
+## Step G.3 — Reactome enrichment (ORA)
+
+Reactome can be cleaner than GO for disease interpretation.
+
+```{r}
+react_up <- enrichPathway(
+  gene          = entrez_up,
+  organism      = "human",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+react_down <- enrichPathway(
+  gene          = entrez_down,
+  organism      = "human",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+
+head(as.data.frame(react_up))
+head(as.data.frame(react_down))
+```
+
+```{r}
+dotplot(react_up, showCategory = 15) + ggtitle("Reactome ORA - Up in COPD")
+
+# Guard: do not plot if empty
+if (nrow(as.data.frame(react_down)) == 0) {
+  cat("Reactome ORA (down) returned no significant pathways at q < 0.05.\n",
+      "This can happen if the down gene list is broad and non-specific, or if mapping reduces the list.\n")
+} else {
+  dotplot(react_down, showCategory = 15) + ggtitle("Reactome ORA - Down in COPD")
+}
+
+cat(
+  "Interpretation (Reactome enrichment — Up in COPD):\n",
+  "- Reactome pathways are curated and often more interpretable than GO.\n",
+  "- Enrichment for ECM organisation, collagen degradation, integrin signalling, and immune pathways fits COPD tissue remodelling.\n",
+  "- Pathways with larger gene counts and low FDR are the strongest signals.\n",
+  sep = ""
+)
+
+cat(
+  "\n\nInterpretation (Reactome enrichment — Down in COPD):\n",
+  "- If this output is empty (0 rows), it usually means no Reactome pathways pass the chosen FDR cutoff.\n",
+  "- Common reasons: fewer mapped Entrez IDs for downregulated genes, weaker coordinated pathway structure, or conservative thresholds.\n",
+  "- You can explore with a relaxed cutoff (e.g., qvalueCutoff = 0.10) or switch to ranked GSEA (which does not require a hard DE cutoff).\n",
+  sep = ""
+)
+```
+
+# Step H — Reactome GSEA (rank-based enrichment)
+
+GSEA uses the full ranked signal rather than a hard significance cut-off. This is often more stable.
+
+## Step H.1 — Build the ranked gene list (limma t-statistic)
+
+Important: use the full mapping table from GPL, not only the significant subset.
+
+```{r}
+gene_list <- results$t
+
+entrez_map_full <- annot_map %>%
+  dplyr::select(ProbeID, ENTREZID) %>%
+  dplyr::filter(!is.na(ENTREZID))
+
+names(gene_list) <- entrez_map_full$ENTREZID[match(rownames(results), entrez_map_full$ProbeID)]
+```
+
+## Step H.2 — Pre-GSEA cleaning (must be sorted and unique)
+
+This block prevents the common GSEA failures: NA names, duplicated Entrez IDs, and unsorted vectors.
+
+```{r}
+# Must be numeric and named
+stopifnot(is.numeric(gene_list))
+stopifnot(!is.null(names(gene_list)))
+
+# Remove NA and non-finite values
+gene_list <- gene_list[is.finite(gene_list)]
+gene_list <- gene_list[!is.na(names(gene_list))]
+
+# Make names character (Entrez IDs)
+names(gene_list) <- as.character(names(gene_list))
+
+# Sort decreasing and drop duplicates (keep the best-ranked instance)
+gene_list <- sort(gene_list, decreasing = TRUE)
+gene_list <- gene_list[!duplicated(names(gene_list))]
+
+# Final check: sorted decreasing
+all(diff(gene_list) <= 0, na.rm = TRUE)
+length(gene_list)
+head(gene_list)
+```
+
+## Step H.3 — Run Reactome GSEA
+
+```{r}
+gsea_reactome <- gsePathway(
+  geneList      = gene_list,
+  organism      = "human",
+  pAdjustMethod = "BH",
+  pvalueCutoff  = 0.05,
+  verbose       = FALSE
+)
+
+head(as.data.frame(gsea_reactome))
+```
+
+## Step H.4 — Visualise GSEA results
+
+```{r}
+gsea_df <- as.data.frame(gsea_reactome)
+
+if (is.null(gsea_reactome) || nrow(gsea_df) == 0) {
+  cat("No significant Reactome GSEA pathways at FDR < 0.05.\n",
+      "Try pvalueCutoff = 0.1, or double-check Entrez mapping.\n")
+} else {
+  dotplot(gsea_reactome, showCategory = 15) +
+    ggtitle("Reactome GSEA - Ranked by limma t-statistic") +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+}
+
+cat(
+  "Interpretation (Reactome GSEA — ranked by limma t-stat):\n",
+  "- This uses the full ranked gene list (by limma t-stat), not just a 'significant genes' cutoff.\n",
+  "- It detects pathways where many genes shift in a coordinated direction, even if individual genes are modest.\n",
+  "- NES (Normalised Enrichment Score) indicates direction:\n",
+  "    * Positive NES = enriched at the top of the ranking (more up in COPD if ranking is COPD-positive).\n",
+  "    * Negative NES = enriched at the bottom (more down in COPD).\n",
+  "- Very low adjusted p-values indicate strong, consistent pathway-level shifts.\n",
+  sep = ""
+)
+```
+
+## Step H.5 — Plot one enrichment curve (strongest evidence figure)
+
+```{r}
+library(enrichplot)
+library(ggplot2)
+
+if (!is.null(gsea_reactome) && nrow(as.data.frame(gsea_reactome)) > 0) {
+
+  gsea_df  <- as.data.frame(gsea_reactome)
+  top_id   <- gsea_df$ID[1]
+  top_desc <- gsea_df$Description[1]
+
+  gseaplot2(
+    gsea_reactome,
+    geneSetID = top_id,
+    title     = paste("GSEA Enrichment —", top_desc),
+    color     = "firebrick",
+    base_size = 13,
+    rel_heights = c(1.5, 0.4, 0.8)
+  )
+
+} else {
+  message("No significant Reactome GSEA results found — skipping enrichment plot.")
+}
+
+cat(
+  "Interpretation (GSEA Enrichment Curve):\n",
+  "- The enrichment curve shows the running enrichment score as you move down the ranked gene list.\n",
+  "- Black tick marks show where genes from this pathway appear in the ranked list.\n",
+  "- A peak near the left = pathway genes concentrated among the most upregulated genes in COPD.\n",
+  "- A peak near the right = enrichment among downregulated genes.\n",
+  "- The bottom bar shows the ranked list metric (e.g. t-statistic or log2FC).\n",
+  "- This is often the most convincing single figure — it shows the enrichment signal directly.\n",
+  sep = ""
+)
+
+```
+# Step I — Integrated Biological Interpretation
+```{r}
+cat(
+"Final Integrated Interpretation:\n\n",
+"This transcriptomic analysis of COPD lung tissue reveals a coordinated molecular reprogramming characterised by extracellular matrix remodeling, altered SLIT–ROBO signaling, and suppression of core translational machinery.\n\n",
+"PCA demonstrated that although COPD status does not dominate total variance (PC1), a significant disease-associated axis is present (PC2), indicating structured but heterogeneous transcriptional shifts.\n\n",
+"Differential expression identified widespread dysregulation, and pathway-level enrichment confirmed that these changes are not random but reflect coordinated biological programs.\n\n",
+"Rank-based Reactome GSEA further strengthened this conclusion by detecting consistent pathway-level shifts without arbitrary gene cutoffs, highlighting structural remodeling and translational suppression as dominant COPD-associated programs.\n\n",
+"Together, these findings support a model in which COPD lung tissue undergoes chronic structural reorganization and stress-associated signaling reprogramming, rather than isolated gene-level perturbations.",
+sep = ""
+)
+```
+
+# Step J — Save outputs and report session info
+
+Keeping saved tables makes your GitHub repo reproducible.
+
+```{r}
+dir.create("results", showWarnings = FALSE)
+
+write.csv(annotated, file.path("results", "limma_sig_strong_annotated.csv"), row.names = FALSE)
+write.csv(as.data.frame(ego_up), file.path("results", "GO_up_COPD.csv"), row.names = FALSE)
+write.csv(as.data.frame(ego_down), file.path("results", "GO_down_COPD.csv"), row.names = FALSE)
+write.csv(as.data.frame(react_up), file.path("results", "Reactome_ORA_up.csv"), row.names = FALSE)
+write.csv(as.data.frame(react_down), file.path("results", "Reactome_ORA_down.csv"), row.names = FALSE)
+write.csv(as.data.frame(gsea_reactome), file.path("results", "Reactome_GSEA.csv"), row.names = FALSE)
+```
+
+# Step K — Limitations and Considerations
+```{r}
+cat(
+"Limitations:\n",
+"- Microarray platforms have limited dynamic range compared to RNA-seq.\n",
+"- Bulk lung tissue mixes multiple cell types, potentially confounding cell composition effects.\n",
+"- Smoking status, inflammation level, and batch effects may contribute to dominant variance axes.\n",
+"- Causality cannot be inferred from cross-sectional differential expression.\n",
+"- Functional validation would be required to confirm pathway-level conclusions.\n",
+sep = ""
+)
+
+cat(
+"\n\nClinical Context:\n",
+"The observed enrichment of extracellular matrix and signaling pathways aligns with known COPD pathology involving airway remodeling, fibrosis, and altered epithelial–stromal communication.\n",
+sep = ""
+)
+
+cat(
+"\n\nMethodological Summary:\n",
+"Data were quality filtered using detection p-values, log2-transformed, analyzed using limma with empirical Bayes moderation, and interpreted using both over-representation analysis and rank-based GSEA to ensure robustness of pathway-level findings.\n",
+sep = ""
+)
+
+```
+
+```{r}
+sessionInfo()
+```
